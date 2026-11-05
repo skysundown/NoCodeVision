@@ -561,6 +561,11 @@ public class VisionFlowStep : ViewModelBase
 
     private bool _useDpm = true;
 
+    /// <summary>一次最多读几条码：整盘/多标签照片填大一点（比如 32、64），只读单个工件填 1。</summary>
+    public int CodeMaxCount { get => _codeMaxCount; set => SetField(ref _codeMaxCount, value); }
+
+    private int _codeMaxCount = 1;
+
     /// <summary>TCP 发送：目标 IP / 端口 / 超时 / 结尾符（填了就自己连自己发，不用先去「通讯」页建通道）。</summary>
     public string TcpHost { get => _tcpHost; set => SetField(ref _tcpHost, value); }
 
@@ -3650,6 +3655,28 @@ public class FlowViewModel : ViewModelBase
             };
             return;
         }
+        if (key == "tray")
+        {
+            // 整盘扫码：不做定位，整张图一次把能读的码全读出来，逐条画框后发 TCP
+            // 注意：样张是整盘距离拍的，一条标签的条码只剩 ~650px（约 2px/模块）且发糊，实测一条都解不出来；
+            //       这个例子主要用来验证「一次读多条」这条链路，换成近拍照（单条码 ≥1500px）才能真正读出内容。
+            var trayDir = Helpers.AppPaths.ResolvePath(@"Projects\条码识别");
+            flow.Steps = new ObservableCollection<VisionFlowStep>
+            {
+                MkStep(1, "拍张照片", "读整盘图", s => { s.CaptureMode = "打开文件夹"; s.FolderPath = System.IO.Path.Combine(trayDir, "整盘3张"); }),
+                MkStep(2, "读条码", "整盘批量读", s =>
+                {
+                    s.CompareSource = "上一步结果";   // 不套定位框，整张图都找
+                    s.MatchMode = "一维条码";
+                    s.CodeMaxCount = 64;
+                    s.UseDpm = false;                 // 增强链是给单个难码用的，整盘逐档重扫太慢
+                    s.OutputVar = "trayCodes";
+                }),
+                MkStep(3, "TCP 发送", "发给MES", s => { s.TcpHost = "127.0.0.1"; s.TcpPort = 9000; s.CompareSource = "第2步"; s.LineEnd = "换行 LF"; s.TcpTimeout = 1500; }),
+                MkStep(4, "显示结果", "逐条画框", s => { s.CompareSource = "第2步"; s.CompareVar = "第2步"; s.MeasureType = "圆和点"; s.NotifyMessage = "TRAY"; }),
+            };
+            return;
+        }
         if (key == "qr")
         {
             // 二维码定位发送：模板匹配先找到码 → 只在那一块里读（点阵码增强）→ 字符串发 TCP → 画到图上
@@ -5897,6 +5924,7 @@ public class FlowViewModel : ViewModelBase
                 ("zeroshot", "示例：一样本查瑕疵（要和标准图比）", "拍张照片 → 一样本查瑕疵（和一张标准图比差异，不用训练）→ 判个数 → 显示结果（4 步）"),
                 ("qr", "示例：二维码定位发送", "拍张照片 → 图里找图案定位码 → 读二维码（点阵码增强）→ TCP 发送 → 显示结果（5 步）"),
                 ("barcode", "示例：条码定位发送", "拍张照片 → 图里找图案定位条码 → 读条码 → TCP 发送 → 显示结果（5 步）"),
+                ("tray", "示例：整盘条码批量读取", "拍张照片 → 读条码（一次最多 64 条、逐条画框）→ TCP 发送 → 显示结果（4 步，三张整盘实拍照在「条码识别」工程的「整盘3张」文件夹里）。注意：这三张是整盘距离拍的，一条标签的条码只有 ~650px、约 2px/模块且发糊，实测 0/176 全读不出——这个例子用来验证批量读码链路，换成近拍（单条码 ≥1500px）才能真读出内容。"),
                 ("pcba", "示例：PCBA 元件有无（AOI）", "拍张照片 → 一样本查瑕疵（和一张好板比）→ 判个数（零容忍）→ 显示结果（4 步，图在「PCBA元件有无」工程里）"),
                 ("metrology", "示例：精找圆 + 精找直线", "拍张照片 → 精找圆（亚像素卡尺 + 稳健拟合，切掉一段弧也能拟合）→ 精找直线 → 显示结果（4 步，图在「精找圆找直线」工程里）"),
                 ("edge", "示例：真图找边（难例）", "拍张照片 → 精找直线（暗场里一条很淡的亮带，满屏灰尘）→ 显示结果（3 步，图在「真图找边」工程里）"),
@@ -10114,7 +10142,26 @@ public class FlowViewModel : ViewModelBase
 
                     string text = "", format = "", how = "";
 
-                    if (step.UseDpm && _sharedImage != null && !_sharedImage.Empty())
+                    var allBoxes = new System.Collections.Generic.List<(double X, double Y, double W, double H)>();
+
+                    // 一次读多条才走这条快路：整盘照片里几十个标签一趟全读出来，每条一个框，坐标直接落在原图上。
+                    // 只读 1 条时不走：zxing 在 maxSymbols=1 时给的框会退化，而且老的多档增强链对单个难码更管用。
+
+                    var hits = step.CodeMaxCount > 1 && _sharedImage != null && !_sharedImage.Empty()
+
+                        ? Vision.DpmQr.ReadAll(_sharedImage, box, want, step.CodeMaxCount)
+
+                        : new System.Collections.Generic.List<Vision.DpmQr.Result>();
+
+                    if (hits.Count > 0)
+                    {
+                        text = hits.Count == 1 ? hits[0].Text : string.Join(" | ", hits.Select(h2 => h2.Text));
+                        format = hits[0].Format;
+                        how = $"（整盘直读 {hits.Count} 条，{hits[0].Ms}毫秒）";
+                        foreach (var h2 in hits) allBoxes.Add((h2.Box.X, h2.Box.Y, h2.Box.Width, h2.Box.Height));
+                    }
+
+                    if (string.IsNullOrEmpty(text) && step.UseDpm && _sharedImage != null && !_sharedImage.Empty())
 
                     {
 
@@ -10140,7 +10187,9 @@ public class FlowViewModel : ViewModelBase
 
                     }
 
-                    if (string.IsNullOrEmpty(text)) return Fail(step.UseDpm ? "没读到码（点阵增强和普通读法都没解出来）" : "没读到码");
+                    if (string.IsNullOrEmpty(text)) return Fail(box is { } bx
+                        ? $"没读到码（只在这 {bx.Width}×{bx.Height} 的小块里找；条高要 ≥20px、每个模块要 ≥3px，框太小或拍糊了就解不出来）"
+                        : "没读到码（整盘一次拍这么多标签，单条码只剩 1~2px/模块，属成像分辨率不足：请近拍、换更高分辨率相机或对好焦）");
 
                     Done(text, $"{format}：{text}{how}");
 
@@ -10153,6 +10202,7 @@ public class FlowViewModel : ViewModelBase
                         Text = text, Value = text.Length,
 
                         HasBox = box is { }, Bx = box?.X ?? 0, By = box?.Y ?? 0, Bw = box?.Width ?? 0, Bh = box?.Height ?? 0,
+                        Boxes = allBoxes,
 
                     });
 

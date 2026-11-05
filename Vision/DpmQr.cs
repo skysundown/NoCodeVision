@@ -22,6 +22,8 @@ public static class DpmQr
         public string How = "";
         public string CodeFormat = "";
         public long Ms;
+        /// <summary>码在整张图上的位置（只有 ReadAll 会填，逐条画框用）。</summary>
+        public Rect Box;
         public bool Ok => Text.Length > 0;
         public override string ToString() => Ok ? $"{Format}：{Text}（{How}）" : "没读到";
     }
@@ -38,12 +40,16 @@ public static class DpmQr
         public ZC.BarcodeReader? Cpp;
         public string Want = "";
 
-        public static Decoders Open(string want)
+        public static Decoders Open(string want, bool? downscale = null, int maxSymbols = 0)
         {
             var d = new Decoders { Want = (want ?? "").Trim() };
             try
             {
-                d.Cpp = new ZC.BarcodeReader { TryHarder = true, TryRotate = true, TryInvert = true };
+                var r = new ZC.BarcodeReader { TryHarder = true, TryRotate = true, TryInvert = true };
+                // 大图默认会先降采样提速，整盘一次读多条时关掉，否则小条码跟着一起被降没了
+                if (downscale.HasValue) r.TryDownscale = downscale.Value;
+                if (maxSymbols > 0) r.MaxNumberOfSymbols = maxSymbols;
+                d.Cpp = r;
                 if (d.Want == "qr") d.Cpp.Formats = ZC.BarcodeFormats.Parse("QRCode|DataMatrix");
                 else if (d.Want == "1d") d.Cpp.Formats = ZC.BarcodeFormat.AllLinear;
                 var probe = new byte[8 * 8];
@@ -67,6 +73,29 @@ public static class DpmQr
                 catch { }
             }
             return TryNet(gray);
+        }
+
+        /// <summary>一次解出这张图里全部能读的码：文本 + 码制 + 在这张图上的位置。</summary>
+        public List<(string Text, string Format, Rect Box)> TryAll(Mat gray)
+        {
+            var list = new List<(string, string, Rect)>();
+            if (gray.Empty() || Cpp == null) return list;
+            try
+            {
+                var iv = new ZC.ImageView(gray.Data, gray.Width, gray.Height, ZC.ImageFormat.Lum, (int)gray.Step(), 1);
+                foreach (var b in Cpp.From(iv))
+                {
+                    if (string.IsNullOrEmpty(b.Text)) continue;
+                    var p = b.Position;
+                    int x0 = Math.Min(Math.Min(p.TopLeft.X, p.TopRight.X), Math.Min(p.BottomLeft.X, p.BottomRight.X));
+                    int y0 = Math.Min(Math.Min(p.TopLeft.Y, p.BottomLeft.Y), Math.Min(p.TopRight.Y, p.BottomRight.Y));
+                    int x1 = Math.Max(Math.Max(p.TopLeft.X, p.TopRight.X), Math.Max(p.BottomLeft.X, p.BottomRight.X));
+                    int y1 = Math.Max(Math.Max(p.TopLeft.Y, p.BottomLeft.Y), Math.Max(p.TopRight.Y, p.BottomRight.Y));
+                    list.Add((b.Text, b.Format.ToString(), new Rect(Math.Max(0, x0), Math.Max(0, y0), Math.Max(1, x1 - x0), Math.Max(1, y1 - y0))));
+                }
+            }
+            catch { }
+            return list;
         }
 
         static string TryNet(Mat gray)
@@ -153,6 +182,33 @@ public static class DpmQr
             list.Add(("密度峰" + frac.ToString("0.##"), new Mat(m, new Rect(x, y, side, side))));
         }
         return list;
+    }
+
+    /// <summary>
+    /// 一次读多条：整盘/多标签的照片，按原图分辨率（不降采样）把这一张里能解出来的码全解出来，位置直接落在原图坐标上。
+    /// 只走「灰度直读」这一条快路：一条都没解出来时调用方再退回 Read 的多档增强链。
+    /// </summary>
+    public static List<Result> ReadAll(Mat image, Rect? roi = null, string want = "", int maxCodes = 64)
+    {
+        var hits = new List<Result>();
+        if (image == null || image.Empty() || maxCodes <= 0) return hits;
+        var sw = Stopwatch.StartNew();
+
+        var r0 = roi is { } r ? Clamp(r, image) : new Rect(0, 0, image.Width, image.Height);
+        if (r0.Width < 8 || r0.Height < 8) return hits;
+
+        using var src = new Mat(image, r0);
+        using var gray = ToGray(src);
+        using var dec = Decoders.Open(want, downscale: false, maxSymbols: maxCodes);
+        foreach (var (text, format, box) in dec.TryAll(gray))
+            hits.Add(new Result
+            {
+                Text = text, Format = format, How = "整盘直读",
+                Box = new Rect(box.X + r0.X, box.Y + r0.Y, box.Width, box.Height),
+            });
+        sw.Stop();
+        foreach (var h in hits) h.Ms = sw.ElapsedMilliseconds;
+        return hits;
     }
 
     /// <summary>
