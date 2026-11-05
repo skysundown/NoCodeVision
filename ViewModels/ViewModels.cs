@@ -3657,23 +3657,22 @@ public class FlowViewModel : ViewModelBase
         }
         if (key == "tray")
         {
-            // 整盘扫码：不做定位，整张图一次把能读的码全读出来，逐条画框后发 TCP
+            // 整盘扫码：先框住其中一张标签的条码带 → 只在那一块里读 → 字符串发 TCP → 画到图上
             // 注意：样张是整盘距离拍的，一条标签的条码只剩 ~650px（约 2px/模块）且发糊，实测一条都解不出来；
-            //       这个例子主要用来验证「一次读多条」这条链路，换成近拍照（单条码 ≥1500px）才能真正读出内容。
+            //       这个例子演示的是「框区域 → 读码」这条链路，换成近拍（单条码 ≥1500px）才能真正读出内容。
             var trayDir = Helpers.AppPaths.ResolvePath(@"Projects\条码识别");
             flow.Steps = new ObservableCollection<VisionFlowStep>
             {
                 MkStep(1, "拍张照片", "读整盘图", s => { s.CaptureMode = "打开文件夹"; s.FolderPath = System.IO.Path.Combine(trayDir, "整盘3张"); }),
-                MkStep(2, "读条码", "整盘批量读", s =>
+                MkStep(2, "取指定区域", "框住一条标签", s =>
                 {
-                    s.CompareSource = "上一步结果";   // 不套定位框，整张图都找
-                    s.MatchMode = "一维条码";
-                    s.CodeMaxCount = 64;
-                    s.UseDpm = false;                 // 增强链是给单个难码用的，整盘逐档重扫太慢
-                    s.OutputVar = "trayCodes";
+                    // 整盘01.jpg 左上那张标签的条码带（含四周留白）；换图后在图上重新框一下
+                    s.MatchMode = "用我框的区域";
+                    s.RoiX = 1240; s.RoiY = 470; s.RoiW = 780; s.RoiH = 150;
                 }),
-                MkStep(3, "TCP 发送", "发给MES", s => { s.TcpHost = "127.0.0.1"; s.TcpPort = 9000; s.CompareSource = "第2步"; s.LineEnd = "换行 LF"; s.TcpTimeout = 1500; }),
-                MkStep(4, "显示结果", "逐条画框", s => { s.CompareSource = "第2步"; s.CompareVar = "第2步"; s.MeasureType = "圆和点"; s.NotifyMessage = "TRAY"; }),
+                MkStep(3, "读条码", "读这一条", s => { s.CompareSource = "第2步"; s.MatchMode = "一维条码"; s.UseDpm = true; s.CodeMaxCount = 1; s.OutputVar = "trayCode"; }),
+                MkStep(4, "TCP 发送", "发给MES", s => { s.TcpHost = "127.0.0.1"; s.TcpPort = 9000; s.CompareSource = "第3步"; s.LineEnd = "换行 LF"; s.TcpTimeout = 1500; }),
+                MkStep(5, "显示结果", "画到图上", s => { s.CompareSource = "第3步"; s.CompareVar = "第2步"; s.MeasureType = "圆和点"; s.NotifyMessage = "TRAY"; }),
             };
             return;
         }
@@ -5924,7 +5923,7 @@ public class FlowViewModel : ViewModelBase
                 ("zeroshot", "示例：一样本查瑕疵（要和标准图比）", "拍张照片 → 一样本查瑕疵（和一张标准图比差异，不用训练）→ 判个数 → 显示结果（4 步）"),
                 ("qr", "示例：二维码定位发送", "拍张照片 → 图里找图案定位码 → 读二维码（点阵码增强）→ TCP 发送 → 显示结果（5 步）"),
                 ("barcode", "示例：条码定位发送", "拍张照片 → 图里找图案定位条码 → 读条码 → TCP 发送 → 显示结果（5 步）"),
-                ("tray", "示例：整盘条码批量读取", "拍张照片 → 读条码（一次最多 64 条、逐条画框）→ TCP 发送 → 显示结果（4 步，三张整盘实拍照在「条码识别」工程的「整盘3张」文件夹里）。注意：这三张是整盘距离拍的，一条标签的条码只有 ~650px、约 2px/模块且发糊，实测 0/176 全读不出——这个例子用来验证批量读码链路，换成近拍（单条码 ≥1500px）才能真读出内容。"),
+                ("tray", "示例：整盘里框一张标签读条码", "拍张照片 → 取指定区域（框住一条标签的条码带）→ 读条码（只在这一块里读）→ TCP 发送 → 显示结果（5 步，三张整盘实拍照在「条码识别」工程的「整盘3张」文件夹里）。注意：这三张是整盘距离拍的，一条标签的条码只有 ~650px、约 2px/模块且发糊，实测 0/176 全读不出——例子演示的是「框区域→读码」这条链路，换成近拍（单条码 ≥1500px）才能真读出内容。"),
                 ("pcba", "示例：PCBA 元件有无（AOI）", "拍张照片 → 一样本查瑕疵（和一张好板比）→ 判个数（零容忍）→ 显示结果（4 步，图在「PCBA元件有无」工程里）"),
                 ("metrology", "示例：精找圆 + 精找直线", "拍张照片 → 精找圆（亚像素卡尺 + 稳健拟合，切掉一段弧也能拟合）→ 精找直线 → 显示结果（4 步，图在「精找圆找直线」工程里）"),
                 ("edge", "示例：真图找边（难例）", "拍张照片 → 精找直线（暗场里一条很淡的亮带，满屏灰尘）→ 显示结果（3 步，图在「真图找边」工程里）"),
@@ -8212,7 +8211,13 @@ public class FlowViewModel : ViewModelBase
 
         var r = new GeoResult { Text = step.ActualValue ?? "" };
 
-        if (nums.Count >= 2) { r.HasPoint = true; r.Px = nums[0]; r.Py = nums[1]; }
+        // 只有写成坐标样子（带逗号，比如 "(120,88)"）才当点用；"5472×3648" 那种是图片尺寸，
+
+        // 当成点会把读码框挤到右下角一小块，码全被切掉
+
+        bool looksLikePoint = (step.ActualValue ?? "").Contains(',') || (step.ActualValue ?? "").Contains('，');
+
+        if (nums.Count >= 2 && looksLikePoint) { r.HasPoint = true; r.Px = nums[0]; r.Py = nums[1]; }
 
         if ((step.ActualValue ?? "").Contains("圆心") && nums.Count >= 3) { r.HasCircle = true; r.Cx = nums[0]; r.Cy = nums[1]; r.R = nums[2]; }
 
@@ -10113,6 +10118,78 @@ public class FlowViewModel : ViewModelBase
                 _sharedImage?.Dispose(); _sharedImage = outMat;
 
                 Done("已处理", step.Name);
+
+                break;
+
+            }
+
+
+
+            // ---------- 区域 ----------
+
+            case "RoiRegion":
+
+            {
+
+                var img = _sharedImage;
+
+                if (img == null || img.Empty()) return Fail("没有图像");
+
+
+
+                OpenCvSharp.Rect region;
+
+                string from;
+
+                var up = step.MatchMode == "沿用上一步的定位框" ? GeoOf(flow, "上一步结果", step) : null;
+
+                if (up is { } u && u.HasBox && u.Bw > 4 && u.Bh > 4)
+
+                {
+
+                    region = new OpenCvSharp.Rect((int)Math.Round(u.Bx), (int)Math.Round(u.By), (int)Math.Round(u.Bw), (int)Math.Round(u.Bh));
+
+                    from = "上一步定位框";
+
+                }
+
+                else if (up is { } c && c.HasCircle && c.R > 4)
+
+                {
+
+                    region = new OpenCvSharp.Rect((int)Math.Round(c.Cx - c.R), (int)Math.Round(c.Cy - c.R), (int)Math.Round(c.R * 2), (int)Math.Round(c.R * 2));
+
+                    from = "上一步定位圆";
+
+                }
+
+                else
+
+                {
+
+                    var b = StepRoiBox(step, img);
+
+                    region = new OpenCvSharp.Rect((int)Math.Round(b.X), (int)Math.Round(b.Y), (int)Math.Round(b.Width), (int)Math.Round(b.Height));
+
+                    from = region.Width >= img.Width && region.Height >= img.Height ? "没框区域(整张图)" : "手框区域";
+
+                }
+
+
+
+                GeoPut(step, new GeoResult
+
+                {
+
+                    Text = $"{region.Width}×{region.Height}", Value = region.Width * region.Height,
+
+                    HasBox = true, Bx = region.X, By = region.Y, Bw = region.Width, Bh = region.Height,
+
+                });
+
+                SetVar(step.OutputVar, $"{region.X},{region.Y},{region.Width},{region.Height}");
+
+                Done($"{region.X},{region.Y},{region.Width},{region.Height}", $"{from}：{region.Width}×{region.Height}");
 
                 break;
 
